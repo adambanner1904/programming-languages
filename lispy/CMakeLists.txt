@@ -4,12 +4,8 @@ project(lispy C)
 set(CMAKE_C_STANDARD 11)
 
 add_executable(lispy
-        main.c
-        lval.c
-        parsing.c
-        eval.c
         deps/mpc.c
-        lenv.c
+        main.c
 )
 
 target_link_libraries(lispy edit)
