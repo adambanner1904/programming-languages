@@ -4,6 +4,30 @@
 
 #include "mpc.h"
 #include <editline/readline.h>
+
+#define LASSERT(args, cond, err) \
+    if (!(cond)) { lval_del(args); return Error(err); }
+
+#define LASSERT_NUM(args, num, fname) \
+    if (args->count != num) { \
+        lval_del(args); \
+        return Error("Function '%s' passed too many arguments. Expected %i, got %i. ", \
+            fname, num, args->count); \
+        }
+
+#define LASSERT_TYPE(args, index, expected, fname) \
+    if (args->cell[index]->type != expected) { \
+        lval_del(args); \
+        return Error("Function '%s' passed incorrect type. Expected %i, got %i. ", \
+            fname, expected, args->cell[index]->type); \
+    }
+
+#define LASSERT_ARGS_NONEMPTY(args, fname) \
+    if (args->cell[0]->count == 0) { \
+        lval_del(args); \
+        return Error("Function '%s' passed {}! ", fname); \
+    }
+
 typedef struct LispValue LispValue;
 
 typedef struct LispValue {
@@ -20,7 +44,7 @@ typedef struct LispValue {
 } LispValue;
 
 // Enum of lval types
-enum {LVAL_NUM, LVAL_ERR, LVAL_SYM, LVAL_SEXPR};
+enum {LVAL_NUM, LVAL_ERR, LVAL_SYM, LVAL_SEXPR, LVAL_QEXPR};
 // Enum of lval error types
 enum {LERR_DIV_ZERO, LERR_BAD_OP, LERR_BAD_NUM};
 
@@ -31,9 +55,17 @@ LispValue* Number(long x) {
     return v;
 }
 
-LispValue* Error(char* m) {
+LispValue* Error(char* m, ...) {
     LispValue* v = malloc(sizeof(LispValue));
-    *v = (LispValue){.type = LVAL_ERR, .err = strdup(m)};
+    *v = (LispValue){.type = LVAL_ERR};
+
+    va_list va;
+    va_start(va, m);
+
+    v->err = malloc(512);
+    vsnprintf(v->err, 511, m, va);
+    v->err = realloc(v->err, strlen(v->err) + 1);
+    va_end(va);
     return v;
 }
 
@@ -48,6 +80,12 @@ LispValue* Sexpr() {
     *v = (LispValue){.type = LVAL_SEXPR};
     return v;
 }
+
+LispValue* Qexpr() {
+    LispValue* v = malloc(sizeof(LispValue));
+    *v = (LispValue){.type = LVAL_QEXPR};
+    return v;
+}
 // LispValue manipulation ///////////////////////////////////////////////////////////////////////////////
 void lval_del(LispValue* v) {
     switch (v->type) {
@@ -57,6 +95,7 @@ void lval_del(LispValue* v) {
         case LVAL_SYM: free(v->sym); break;
 
         case LVAL_SEXPR:
+        case LVAL_QEXPR:
             for (int i = 0; i < v->count; i++) {
                 lval_del(v->cell[i]);
             }
@@ -92,6 +131,18 @@ LispValue* lval_take(LispValue* v, int i) {
     return x;
 }
 
+LispValue* lval_join(LispValue* x, LispValue* y) {
+
+    /* For each cell in 'y' add it to 'x' */
+    while (y->count) {
+        x = lval_append(x, lval_pop(y, 0));
+    }
+
+    /* Delete the empty 'y' and return 'x' */
+    lval_del(y);
+    return x;
+}
+
 
 void lval_expr_print(LispValue* v, char open, char close);
 void lval_print(LispValue* v) {
@@ -101,6 +152,7 @@ void lval_print(LispValue* v) {
         case LVAL_ERR: printf("Err: %s", v->err); break;
         case LVAL_SYM: printf("%s", v->sym); break;
         case LVAL_SEXPR: lval_expr_print(v, '(', ')'); break;
+        case LVAL_QEXPR: lval_expr_print(v, '{', '}'); break;
     }
 }
 
@@ -133,12 +185,15 @@ LispValue* lval_read(mpc_ast_t* t) {
     if (strstr(t->tag, "symbol")) { return Symbol(t->contents); }
 
     LispValue* x = NULL;
-    if (strcmp(t->tag, ">") == 0) { x = Sexpr();}
+    if (strcmp(t->tag, ">") == 0) { x = Sexpr(); }
     if (strstr(t->tag, "sexpr")) { x = Sexpr(); }
+    if (strstr(t->tag, "qexpr")) { x = Qexpr(); }
 
     for (int i = 0; i < t->children_num; i++) {
         if (strcmp(t->children[i]->contents, "(") == 0) { continue; }
         if (strcmp(t->children[i]->contents, ")") == 0) { continue; }
+        if (strcmp(t->children[i]->contents, "{") == 0) { continue; }
+        if (strcmp(t->children[i]->contents, "}") == 0) { continue; }
         if (strcmp(t->children[i]->tag, "regex") == 0) { continue; }
         x = lval_append(x, lval_read(t->children[i]));
     }
@@ -146,6 +201,7 @@ LispValue* lval_read(mpc_ast_t* t) {
 }
 
 // Builtin operations /////////////////////////////////////////////////////////////
+LispValue* lval_eval(LispValue* v);
 
 LispValue* builtin_op(LispValue* args, char* op) {
     // typecheck all arguments
@@ -184,8 +240,68 @@ LispValue* builtin_op(LispValue* args, char* op) {
     lval_del(args); return x;
 }
 
+LispValue* builtin_head(LispValue* args) {
+    LASSERT_NUM(args, 1, "head");
+    LASSERT_TYPE(args, 0, LVAL_QEXPR, "head");
+    LASSERT_ARGS_NONEMPTY(args, "head");
+
+    LispValue* v = lval_take(args, 0);
+    while (v->count > 1) {lval_del(lval_pop(v, 1));}
+    return v;
+}
+
+LispValue* builtin_tail(LispValue* args) {
+    LASSERT_NUM(args, 1, "tail");
+    LASSERT_TYPE(args, 0, LVAL_QEXPR, "tail");
+    LASSERT_ARGS_NONEMPTY(args, "tail");
+
+    LispValue* v = lval_take(args, 0);
+    lval_del(lval_pop(v, 0));
+    return v;
+}
+
+LispValue* builtin_list(LispValue* args) {
+    args->type = LVAL_QEXPR;
+    return args;
+}
+
+LispValue* builtin_eval(LispValue* args) {
+    LASSERT_NUM(args, 1, "eval");
+    LASSERT_TYPE(args, 0, LVAL_QEXPR, "eval");
+
+    LispValue* x = lval_take(args, 0);
+    x->type = LVAL_SEXPR;
+    return lval_eval(x);
+}
+
+LispValue* builtin_join(LispValue* a) {
+
+    for (int i = 0; i < a->count; i++) {
+        LASSERT_TYPE(a, i, LVAL_QEXPR, "join");
+    }
+
+    LispValue* x = lval_pop(a, 0);
+
+    while (a->count) {
+        x = lval_join(x, lval_pop(a, 0));
+    }
+
+    lval_del(a);
+    return x;
+}
+
+LispValue* builtin(LispValue* a, char* func) {
+    if (strcmp("list", func) == 0) { return builtin_list(a); }
+    if (strcmp("head", func) == 0) { return builtin_head(a); }
+    if (strcmp("tail", func) == 0) { return builtin_tail(a); }
+    if (strcmp("join", func) == 0) { return builtin_join(a); }
+    if (strcmp("eval", func) == 0) { return builtin_eval(a); }
+    if (strstr("+-/*", func)) { return builtin_op(a, func); }
+    lval_del(a);
+    return Error("Unknown Function!");
+}
+
 // eval ///////////////////////////////////////////////////////////////////////////
-LispValue* lval_eval(LispValue* v);
 
 LispValue* lval_eval_sexpr(LispValue* v) {
 
@@ -207,7 +323,8 @@ LispValue* lval_eval_sexpr(LispValue* v) {
         lval_del(f); lval_del(v);
         return Error("S-expression does not start with symbol!");
     }
-    LispValue* result = builtin_op(v, f->sym);
+    LispValue* result = builtin(v, f->sym);
+    lval_del(f);
     return result;
 }
 
@@ -220,16 +337,19 @@ int main(int argc, char *argv[]) {
     mpc_parser_t* Number = mpc_new("number");
     mpc_parser_t* Symbol = mpc_new("symbol");
     mpc_parser_t* Sexpr  = mpc_new("sexpr");
+    mpc_parser_t* Qexpr  = mpc_new("qexpr");
     mpc_parser_t* Expr   = mpc_new("expr");
     mpc_parser_t* Lispy  = mpc_new("lispy");
 
     mpca_lang(MPCA_LANG_DEFAULT,
         "number   : /-?[0-9]+/ ;    "
-        "symbol   : '+' | '-' | '*' | '/' ;"
+        "symbol : \"list\" | \"head\" | \"tail\" | \"join\" | \"eval\" "
+        "| '+' | '-' | '*' | '/' ; "
         "sexpr    : '(' <expr>* ')' ;"
-        "expr     : <number> | <symbol> | <sexpr> ;"
+        "qexpr    : '{' <expr>* '}' ;"
+        "expr     : <number> | <symbol> | <sexpr> | <qexpr> ;"
         "lispy    : /^/ <expr>* /$/ ;",
-        Number, Symbol, Sexpr, Expr, Lispy);
+        Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     puts("Lispy Version 0.0.0.0.2");
     puts("Press Ctrl+c to Exit\n");
@@ -252,7 +372,7 @@ int main(int argc, char *argv[]) {
 
     }
 
-    mpc_cleanup(4, Number, Symbol, Sexpr, Expr, Lispy);
+    mpc_cleanup(6, Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     return 0;
 }
