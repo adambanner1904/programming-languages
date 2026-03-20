@@ -558,6 +558,21 @@ Value* lval_call(Environment* env, Value* func, Value* args) {
         }
 
         Value* sym = lval_pop(func->formals, 0);
+
+        // handle where the sym just popped off is '&'
+        if (strcmp(sym->sym, "&") == 0) {
+            if (func->formals->count !=1 ) {
+                lval_del(args);
+                return Error("Function format invalid. "
+                             "Symbol '&' not followed by single symbol.");
+            }
+
+            Value* nsym = lval_pop(func->formals, 0);
+            lenv_put(func->env, nsym, builtin_list(env, args));
+            lval_del(sym); lval_del(nsym);
+            break;
+        }
+
         Value* val = lval_pop(args, 0);
 
         lenv_put(func->env, sym, val);
@@ -566,6 +581,24 @@ Value* lval_call(Environment* env, Value* func, Value* args) {
 
     // done with arguments as they are now bound in the functions env
     lval_del(args);
+
+    // if '&' remains in formal list bind to empty list
+    if (func->formals->count > 0 &&
+        strcmp(func->formals->cell[0]->sym, "&") == 0) {
+
+        if (func->formals->count != 2) {
+            return Error("Function format invalid. "
+                         "Symbol '&' not followed by single symbol");
+        }
+        // pop and delete '&' symbol
+        lval_del(lval_pop(func->formals, 0));
+
+        Value* sym = lval_pop(func->formals, 0);
+        Value* val = Qexpr();
+
+        lenv_put(func->env, sym, val);
+        lval_del(sym); lval_del(val);
+    }
 
     if (func->formals->count == 0) {
         func->env->parent = env;
